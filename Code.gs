@@ -166,11 +166,80 @@ function fetchUPSStatus(trackingNumber) {
 }
 
 /**
- * Fetch USPS tracking status using official API
+ * Fetch USPS tracking using 17track public API (no auth needed)
  */
 function fetchUSPSStatus(trackingNumber) {
   try {
-    // Build XML request for USPS Track API
+    // Use 17track's public endpoint - no API key needed for basic tracking
+    const url = 'https://t.17track.net/restapi/track';
+    
+    const payload = {
+      data: [{
+        num: trackingNumber,
+        fc: 21  // 21 = USPS carrier code for 17track
+      }],
+      guid: '',
+      timeZoneOffset: -300
+    };
+    
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Origin': 'https://t.17track.net',
+        'Referer': 'https://t.17track.net/en'
+      }
+    });
+    
+    const data = JSON.parse(response.getContentText());
+    Logger.log('17track response: ' + JSON.stringify(data));
+    
+    if (data.dat && data.dat[0]) {
+      const track = data.dat[0];
+      
+      // Check track status
+      if (track.track && track.track.e) {
+        const status = track.track.e.toLowerCase();
+        const statusCode = track.track.b;
+        
+        // 17track status codes: 
+        // 0=not found, 10=in transit, 20=expired, 30=pickup, 35=undelivered, 40=delivered, 50=alert
+        if (statusCode === 40 || status.includes('delivered')) return STATUS.DELIVERED;
+        if (status.includes('out for delivery')) return STATUS.OUT_FOR_DELIVERY;
+        if (statusCode === 50 || status.includes('alert') || status.includes('exception')) return STATUS.EXCEPTION;
+        if (statusCode === 30 || status.includes('pickup') || status.includes('available')) return STATUS.WAITING_PICKUP;
+        if (status.includes('pre-shipment') || status.includes('label')) return STATUS.LABEL_CREATED;
+        if (statusCode === 10 || status.includes('transit') || status.includes('arrived') || status.includes('departed')) return STATUS.IN_TRANSIT;
+      }
+      
+      // Check track.z1 for latest status
+      if (track.track && track.track.z1) {
+        const latestStatus = track.track.z1.toLowerCase();
+        if (latestStatus.includes('delivered')) return STATUS.DELIVERED;
+        if (latestStatus.includes('out for delivery')) return STATUS.OUT_FOR_DELIVERY;
+        if (latestStatus.includes('pickup') || latestStatus.includes('available')) return STATUS.WAITING_PICKUP;
+        if (latestStatus.includes('transit') || latestStatus.includes('arrived') || latestStatus.includes('departed')) return STATUS.IN_TRANSIT;
+      }
+    }
+    
+    // Fallback: Try USPS official API (if activated)
+    return fetchUSPSStatusAPI(trackingNumber);
+    
+  } catch (e) {
+    Logger.log('17track error: ' + e);
+    // Fallback to USPS API
+    return fetchUSPSStatusAPI(trackingNumber);
+  }
+}
+
+/**
+ * Fetch USPS tracking using official API (requires activation)
+ */
+function fetchUSPSStatusAPI(trackingNumber) {
+  try {
     const xml = `<?xml version="1.0" encoding="UTF-8" ?>
 <TrackFieldRequest USERID="${USPS_USER_ID}">
   <Revision>1</Revision>
@@ -187,89 +256,43 @@ function fetchUSPSStatus(trackingNumber) {
     });
     
     const responseText = response.getContentText();
+    Logger.log('USPS API response: ' + responseText.substring(0, 500));
     
-    // Parse XML response
     const doc = XmlService.parse(responseText);
     const root = doc.getRootElement();
     
-    // Check for errors
-    const error = root.getChild('Error');
-    if (error) {
-      const errorDesc = error.getChildText('Description');
-      Logger.log('USPS API error: ' + errorDesc);
-      return STATUS.NOT_FOUND;
-    }
-    
-    // Get tracking info
     const trackInfo = root.getChild('TrackInfo');
     if (!trackInfo) {
       return STATUS.NOT_FOUND;
     }
     
-    // Check for error in track info
     const trackError = trackInfo.getChild('Error');
     if (trackError) {
+      Logger.log('USPS Track Error: ' + trackError.getChildText('Description'));
       return STATUS.NOT_FOUND;
     }
     
-    // Get status summary
-    const statusSummary = trackInfo.getChildText('StatusSummary') || '';
-    const status = statusSummary.toLowerCase();
-    
-    // Also check individual status fields
+    const statusSummary = (trackInfo.getChildText('StatusSummary') || '').toLowerCase();
     const statusCategory = (trackInfo.getChildText('StatusCategory') || '').toLowerCase();
-    const deliveryDate = trackInfo.getChildText('ExpectedDeliveryDate') || '';
     
-    // Map USPS status to our standard statuses
-    if (status.includes('delivered') || statusCategory === 'delivered') {
-      return STATUS.DELIVERED;
-    }
+    if (statusSummary.includes('delivered') || statusCategory === 'delivered') return STATUS.DELIVERED;
+    if (statusSummary.includes('out for delivery')) return STATUS.OUT_FOR_DELIVERY;
+    if (statusSummary.includes('alert') || statusSummary.includes('undeliverable')) return STATUS.EXCEPTION;
+    if (statusSummary.includes('pickup') || statusSummary.includes('held')) return STATUS.WAITING_PICKUP;
+    if (statusSummary.includes('pre-shipment') || statusSummary.includes('label')) return STATUS.LABEL_CREATED;
+    if (statusSummary.includes('transit') || statusSummary.includes('arrived') || statusSummary.includes('departed') || statusSummary.includes('accepted')) return STATUS.IN_TRANSIT;
     
-    if (status.includes('out for delivery') || statusCategory === 'out for delivery') {
-      return STATUS.OUT_FOR_DELIVERY;
-    }
-    
-    if (status.includes('alert') || status.includes('undeliverable') || 
-        status.includes('no access') || status.includes('return') ||
-        status.includes('refused') || status.includes('deceased') ||
-        statusCategory === 'alert') {
-      return STATUS.EXCEPTION;
-    }
-    
-    if (status.includes('available for pickup') || status.includes('ready for pickup') || 
-        status.includes('held at') || status.includes('notice left') ||
-        statusCategory === 'available for pickup') {
-      return STATUS.WAITING_PICKUP;
-    }
-    
-    if (status.includes('pre-shipment') || status.includes('label created') || 
-        status.includes('shipping label') || status.includes('usps awaiting') ||
-        statusCategory === 'pre-shipment') {
-      return STATUS.LABEL_CREATED;
-    }
-    
-    if (status.includes('in transit') || status.includes('arrived') || 
-        status.includes('departed') || status.includes('processed') ||
-        status.includes('accepted') || status.includes('origin') ||
-        status.includes('en route') || status.includes('forwarded') ||
-        statusCategory === 'in transit') {
-      return STATUS.IN_TRANSIT;
-    }
-    
-    // If we got here with valid track info, assume in transit
-    if (statusSummary.length > 0) {
-      return STATUS.IN_TRANSIT;
-    }
+    if (statusSummary.length > 0) return STATUS.IN_TRANSIT;
     
     return STATUS.NOT_FOUND;
   } catch (e) {
-    Logger.log('USPS error: ' + e);
-    return STATUS.EXCEPTION;
+    Logger.log('USPS API error: ' + e);
+    return STATUS.NOT_FOUND;
   }
 }
 
 /**
- * Fetch FedEx tracking status (web scraping - needs API for reliability)
+ * Fetch FedEx tracking status
  */
 function fetchFedExStatus(trackingNumber) {
   try {
@@ -298,7 +321,7 @@ function fetchFedExStatus(trackingNumber) {
 }
 
 /**
- * Fetch DHL tracking status (web scraping - needs API for reliability)
+ * Fetch DHL tracking status
  */
 function fetchDHLStatus(trackingNumber) {
   try {
@@ -409,7 +432,7 @@ function updateAllTrackingStatus() {
     
     // Small delay to avoid rate limiting
     if (updated % 5 === 0) {
-      Utilities.sleep(300);
+      Utilities.sleep(500);
     }
   }
   
@@ -494,15 +517,16 @@ function showSettings() {
       h2 { color: #333; }
       .api-status { padding: 10px; border-radius: 8px; margin: 10px 0; }
       .api-ok { background: #d4edda; color: #155724; }
+      .api-pending { background: #fff3cd; color: #856404; }
       .api-missing { background: #f8d7da; color: #721c24; }
       .statuses { background: #f5f5f5; padding: 15px; border-radius: 8px; margin-top: 20px; }
     </style>
     <h2>📦 Tracking Settings</h2>
     <h3>API Status:</h3>
-    <div class="api-status api-ok">✅ UPS API: Connected</div>
-    <div class="api-status api-ok">✅ USPS API: Connected</div>
-    <div class="api-status api-missing">⚠️ FedEx: Web scraping (less reliable)</div>
-    <div class="api-status api-missing">⚠️ DHL: Web scraping (less reliable)</div>
+    <div class="api-status api-ok">✅ UPS: Official API</div>
+    <div class="api-status api-ok">✅ USPS: Using 17track + USPS API fallback</div>
+    <div class="api-status api-missing">⚠️ FedEx: Web scraping</div>
+    <div class="api-status api-missing">⚠️ DHL: Web scraping</div>
     <div class="statuses">
       <h3>Status Values:</h3>
       <ul>
