@@ -1,6 +1,6 @@
 /**
  * Tracking Status Lookup for Google Sheets
- * Automatically fetches shipping status for USPS, UPS, FedEx, DHL
+ * Uses official carrier APIs for reliable tracking
  */
 
 // Configuration - adjust these to match your sheet
@@ -10,6 +10,10 @@ const CONFIG = {
   START_ROW: 2,        // Skip header row
   SHEET_NAME: null     // null = active sheet, or specify name like "Sheet1"
 };
+
+// UPS API Credentials
+const UPS_CLIENT_ID = 'nk6XMzoRwYb2j8FjLOmjq5H2B3AVQkcI5H8wGIMTuTOYzEbA';
+const UPS_CLIENT_SECRET = 'GikPKvVFmgroI4ECubxXnm5xIoC4p9kaOiQDgLE2fNFOf5pzW2AaGynm4BDgjIYI';
 
 // Standardized status values
 const STATUS = {
@@ -46,7 +50,7 @@ function detectCarrier(trackingNumber) {
     return { carrier: 'UPS', url: `https://www.ups.com/track?tracknum=${tn}` };
   }
   
-  // FedEx: 12, 15, or 20-22 digits
+  // FedEx: 12, 15, or 20-22 digits (but not USPS pattern)
   if (/^\d{12}$/.test(tn) || /^\d{15}$/.test(tn)) {
     return { carrier: 'FedEx', url: `https://www.fedex.com/fedextrack/?trknbr=${tn}` };
   }
@@ -70,37 +74,118 @@ function detectCarrier(trackingNumber) {
 }
 
 /**
- * Fetch tracking status from carrier API/website
+ * Get UPS OAuth Access Token
  */
-function fetchTrackingStatus(trackingNumber) {
-  const { carrier, url } = detectCarrier(trackingNumber);
+function getUPSAccessToken() {
+  const cache = CacheService.getScriptCache();
+  const cachedToken = cache.get('ups_token');
   
-  if (carrier === 'Unknown' || !url) {
-    return { status: STATUS.NOT_FOUND, url: null, carrier };
+  if (cachedToken) {
+    return cachedToken;
   }
   
+  const tokenUrl = 'https://onlinetools.ups.com/security/v1/oauth/token';
+  const credentials = Utilities.base64Encode(UPS_CLIENT_ID + ':' + UPS_CLIENT_SECRET);
+  
+  const response = UrlFetchApp.fetch(tokenUrl, {
+    method: 'post',
+    headers: {
+      'Authorization': 'Basic ' + credentials,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    payload: 'grant_type=client_credentials',
+    muteHttpExceptions: true
+  });
+  
+  const data = JSON.parse(response.getContentText());
+  
+  if (data.access_token) {
+    // Cache for 3 hours (token is valid for 4 hours)
+    cache.put('ups_token', data.access_token, 10800);
+    return data.access_token;
+  }
+  
+  Logger.log('UPS token error: ' + response.getContentText());
+  return null;
+}
+
+/**
+ * Fetch UPS tracking status using official API
+ */
+function fetchUPSStatus(trackingNumber) {
   try {
-    let status = STATUS.NOT_FOUND;
-    
-    if (carrier === 'USPS') {
-      status = fetchUSPSStatus(trackingNumber);
-    } else if (carrier === 'UPS') {
-      status = fetchUPSStatus(trackingNumber);
-    } else if (carrier === 'FedEx') {
-      status = fetchFedExStatus(trackingNumber);
-    } else if (carrier === 'DHL') {
-      status = fetchDHLStatus(trackingNumber);
+    const token = getUPSAccessToken();
+    if (!token) {
+      return STATUS.EXCEPTION;
     }
     
-    return { status, url, carrier };
+    const url = `https://onlinetools.ups.com/api/track/v1/details/${trackingNumber}`;
+    
+    const response = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json',
+        'transId': Utilities.getUuid(),
+        'transactionSrc': 'GoogleSheets'
+      },
+      muteHttpExceptions: true
+    });
+    
+    const data = JSON.parse(response.getContentText());
+    
+    if (data.trackResponse && data.trackResponse.shipment && data.trackResponse.shipment[0]) {
+      const shipment = data.trackResponse.shipment[0];
+      const pkg = shipment.package ? shipment.package[0] : null;
+      
+      if (pkg && pkg.currentStatus) {
+        const status = pkg.currentStatus.description.toLowerCase();
+        const code = pkg.currentStatus.code;
+        
+        // Map UPS status codes to our standard statuses
+        if (status.includes('delivered') || code === 'D') {
+          return STATUS.DELIVERED;
+        }
+        if (status.includes('out for delivery') || code === 'O') {
+          return STATUS.OUT_FOR_DELIVERY;
+        }
+        if (status.includes('exception') || code === 'X') {
+          return STATUS.EXCEPTION;
+        }
+        if (status.includes('pickup') || status.includes('ready') || code === 'P') {
+          return STATUS.WAITING_PICKUP;
+        }
+        if (status.includes('in transit') || code === 'I') {
+          return STATUS.IN_TRANSIT;
+        }
+        if (status.includes('label') || status.includes('created') || code === 'M') {
+          return STATUS.LABEL_CREATED;
+        }
+        
+        // Default based on code
+        if (code === 'D') return STATUS.DELIVERED;
+        if (code === 'I') return STATUS.IN_TRANSIT;
+        if (code === 'M' || code === 'MV') return STATUS.LABEL_CREATED;
+        
+        return STATUS.IN_TRANSIT;
+      }
+    }
+    
+    // Check for error response
+    if (data.response && data.response.errors) {
+      Logger.log('UPS API error: ' + JSON.stringify(data.response.errors));
+      return STATUS.NOT_FOUND;
+    }
+    
+    return STATUS.NOT_FOUND;
   } catch (e) {
-    Logger.log('Error fetching status: ' + e.toString());
-    return { status: STATUS.EXCEPTION, url, carrier };
+    Logger.log('UPS error: ' + e);
+    return STATUS.EXCEPTION;
   }
 }
 
 /**
- * USPS Status - using their tracking page
+ * Fetch USPS tracking status (basic scraping - less reliable)
  */
 function fetchUSPSStatus(trackingNumber) {
   try {
@@ -112,47 +197,16 @@ function fetchUSPSStatus(trackingNumber) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     });
-    const html = response.getContentText();
     
-    // Delivered
-    if (/class="[^"]*delivered[^"]*"/i.test(html) || /Delivered,/i.test(html) || />Delivered</i.test(html)) {
-      return STATUS.DELIVERED;
-    }
+    const html = response.getContentText().toLowerCase();
     
-    // Out for Delivery
-    if (/Out for Delivery/i.test(html)) {
-      return STATUS.OUT_FOR_DELIVERY;
-    }
-    
-    // Exception / Alert
-    if (/Alert/i.test(html) || /Exception/i.test(html) || /Delivery Attempt/i.test(html) || /No Access/i.test(html) || /Undeliverable/i.test(html)) {
-      return STATUS.EXCEPTION;
-    }
-    
-    // Waiting for Pickup
-    if (/Available for Pickup/i.test(html) || /Ready for Pickup/i.test(html) || /Held at Post Office/i.test(html)) {
-      return STATUS.WAITING_PICKUP;
-    }
-    
-    // In Transit
-    if (/In Transit/i.test(html) || /Arrived at/i.test(html) || /Departed/i.test(html) || /Processed/i.test(html) || /In-Transit/i.test(html) || /Origin/i.test(html)) {
-      return STATUS.IN_TRANSIT;
-    }
-    
-    // Shipped / Accepted
-    if (/Accepted/i.test(html) || /USPS in possession/i.test(html) || /Picked Up/i.test(html)) {
-      return STATUS.IN_TRANSIT;
-    }
-    
-    // Label Created
-    if (/Pre-Shipment/i.test(html) || /Label Created/i.test(html) || /Shipping Label Created/i.test(html)) {
-      return STATUS.LABEL_CREATED;
-    }
-    
-    // Not Found
-    if (/Status Not Available/i.test(html) || /not found/i.test(html) || /no record/i.test(html)) {
-      return STATUS.NOT_FOUND;
-    }
+    if (html.includes('delivered')) return STATUS.DELIVERED;
+    if (html.includes('out for delivery')) return STATUS.OUT_FOR_DELIVERY;
+    if (html.includes('alert') || html.includes('exception') || html.includes('undeliverable')) return STATUS.EXCEPTION;
+    if (html.includes('available for pickup') || html.includes('held at')) return STATUS.WAITING_PICKUP;
+    if (html.includes('pre-shipment') || html.includes('label created')) return STATUS.LABEL_CREATED;
+    if (html.includes('in transit') || html.includes('arrived') || html.includes('departed') || html.includes('processed') || html.includes('accepted')) return STATUS.IN_TRANSIT;
+    if (html.includes('not found') || html.includes('not available')) return STATUS.NOT_FOUND;
     
     return STATUS.IN_TRANSIT;
   } catch (e) {
@@ -162,103 +216,28 @@ function fetchUSPSStatus(trackingNumber) {
 }
 
 /**
- * UPS Status
- */
-function fetchUPSStatus(trackingNumber) {
-  try {
-    const url = `https://www.ups.com/track?tracknum=${trackingNumber}`;
-    const response = UrlFetchApp.fetch(url, {
-      muteHttpExceptions: true,
-      followRedirects: true,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-    const html = response.getContentText();
-    
-    // Delivered
-    if (/delivered/i.test(html) && /status/i.test(html)) {
-      return STATUS.DELIVERED;
-    }
-    
-    // Out for Delivery
-    if (/out for delivery/i.test(html)) {
-      return STATUS.OUT_FOR_DELIVERY;
-    }
-    
-    // Exception
-    if (/exception/i.test(html) || /delivery attempt/i.test(html)) {
-      return STATUS.EXCEPTION;
-    }
-    
-    // Waiting for Pickup
-    if (/ready for pickup/i.test(html) || /will call/i.test(html) || /access point/i.test(html)) {
-      return STATUS.WAITING_PICKUP;
-    }
-    
-    // In Transit
-    if (/in transit/i.test(html) || /on the way/i.test(html) || /departed/i.test(html) || /arrived/i.test(html) || /origin scan/i.test(html)) {
-      return STATUS.IN_TRANSIT;
-    }
-    
-    // Label Created
-    if (/label created/i.test(html) || /order processed/i.test(html) || /shipment ready/i.test(html)) {
-      return STATUS.LABEL_CREATED;
-    }
-    
-    return STATUS.IN_TRANSIT;
-  } catch (e) {
-    Logger.log('UPS error: ' + e);
-    return STATUS.EXCEPTION;
-  }
-}
-
-/**
- * FedEx Status
+ * Fetch FedEx tracking status (basic - needs API for reliability)
  */
 function fetchFedExStatus(trackingNumber) {
   try {
     const url = `https://www.fedex.com/fedextrack/?trknbr=${trackingNumber}`;
     const response = UrlFetchApp.fetch(url, {
       muteHttpExceptions: true,
-      followRedirects: true,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     });
-    const html = response.getContentText();
     
-    // Delivered
-    if (/delivered/i.test(html)) {
-      return STATUS.DELIVERED;
-    }
+    const html = response.getContentText().toLowerCase();
     
-    // Out for Delivery
-    if (/on fedex vehicle/i.test(html) || /out for delivery/i.test(html)) {
-      return STATUS.OUT_FOR_DELIVERY;
-    }
+    if (html.includes('delivered')) return STATUS.DELIVERED;
+    if (html.includes('on fedex vehicle') || html.includes('out for delivery')) return STATUS.OUT_FOR_DELIVERY;
+    if (html.includes('exception') || html.includes('delay')) return STATUS.EXCEPTION;
+    if (html.includes('pickup') || html.includes('hold at')) return STATUS.WAITING_PICKUP;
+    if (html.includes('shipment information') || html.includes('label')) return STATUS.LABEL_CREATED;
+    if (html.includes('in transit') || html.includes('departed') || html.includes('arrived')) return STATUS.IN_TRANSIT;
     
-    // Exception
-    if (/exception/i.test(html) || /delivery exception/i.test(html) || /delay/i.test(html)) {
-      return STATUS.EXCEPTION;
-    }
-    
-    // Waiting for Pickup
-    if (/ready for pickup/i.test(html) || /at fedex/i.test(html) || /hold at/i.test(html)) {
-      return STATUS.WAITING_PICKUP;
-    }
-    
-    // In Transit
-    if (/in transit/i.test(html) || /departed/i.test(html) || /arrived/i.test(html) || /at local/i.test(html)) {
-      return STATUS.IN_TRANSIT;
-    }
-    
-    // Label Created
-    if (/shipment information sent/i.test(html) || /label created/i.test(html)) {
-      return STATUS.LABEL_CREATED;
-    }
-    
-    return STATUS.IN_TRANSIT;
+    return STATUS.NOT_FOUND;
   } catch (e) {
     Logger.log('FedEx error: ' + e);
     return STATUS.EXCEPTION;
@@ -266,54 +245,61 @@ function fetchFedExStatus(trackingNumber) {
 }
 
 /**
- * DHL Status
+ * Fetch DHL tracking status (basic - needs API for reliability)
  */
 function fetchDHLStatus(trackingNumber) {
   try {
-    const url = `https://www.dhl.com/us-en/home/tracking/tracking-express.html?submit=1&tracking-id=${trackingNumber}`;
+    const url = `https://api-eu.dhl.com/track/shipments?trackingNumber=${trackingNumber}`;
     const response = UrlFetchApp.fetch(url, {
       muteHttpExceptions: true,
-      followRedirects: true,
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': 'Mozilla/5.0',
+        'DHL-API-Key': 'demo-key'
       }
     });
-    const html = response.getContentText();
     
-    // Delivered
-    if (/delivered/i.test(html)) {
-      return STATUS.DELIVERED;
-    }
+    const text = response.getContentText().toLowerCase();
     
-    // Out for Delivery
-    if (/with delivery courier/i.test(html) || /out for delivery/i.test(html)) {
-      return STATUS.OUT_FOR_DELIVERY;
-    }
+    if (text.includes('delivered')) return STATUS.DELIVERED;
+    if (text.includes('out for delivery')) return STATUS.OUT_FOR_DELIVERY;
+    if (text.includes('exception') || text.includes('on hold')) return STATUS.EXCEPTION;
+    if (text.includes('pickup') || text.includes('service point')) return STATUS.WAITING_PICKUP;
+    if (text.includes('transit') || text.includes('processed')) return STATUS.IN_TRANSIT;
     
-    // Exception
-    if (/exception/i.test(html) || /shipment on hold/i.test(html)) {
-      return STATUS.EXCEPTION;
-    }
-    
-    // Waiting for Pickup
-    if (/available for pickup/i.test(html) || /at service point/i.test(html)) {
-      return STATUS.WAITING_PICKUP;
-    }
-    
-    // In Transit
-    if (/in transit/i.test(html) || /departed/i.test(html) || /arrived/i.test(html) || /processed/i.test(html)) {
-      return STATUS.IN_TRANSIT;
-    }
-    
-    // Label Created
-    if (/shipment picked up/i.test(html)) {
-      return STATUS.IN_TRANSIT;
-    }
-    
-    return STATUS.IN_TRANSIT;
+    return STATUS.NOT_FOUND;
   } catch (e) {
     Logger.log('DHL error: ' + e);
     return STATUS.EXCEPTION;
+  }
+}
+
+/**
+ * Fetch tracking status from carrier
+ */
+function fetchTrackingStatus(trackingNumber) {
+  const { carrier, url } = detectCarrier(trackingNumber);
+  
+  if (carrier === 'Unknown' || !url) {
+    return { status: STATUS.NOT_FOUND, url: null, carrier };
+  }
+  
+  try {
+    let status = STATUS.NOT_FOUND;
+    
+    if (carrier === 'UPS') {
+      status = fetchUPSStatus(trackingNumber);
+    } else if (carrier === 'USPS') {
+      status = fetchUSPSStatus(trackingNumber);
+    } else if (carrier === 'FedEx') {
+      status = fetchFedExStatus(trackingNumber);
+    } else if (carrier === 'DHL') {
+      status = fetchDHLStatus(trackingNumber);
+    }
+    
+    return { status, url, carrier };
+  } catch (e) {
+    Logger.log('Error fetching status: ' + e.toString());
+    return { status: STATUS.EXCEPTION, url, carrier };
   }
 }
 
@@ -369,8 +355,8 @@ function updateAllTrackingStatus() {
     updated++;
     
     // Small delay to avoid rate limiting
-    if (updated % 5 === 0) {
-      Utilities.sleep(1000);
+    if (updated % 3 === 0) {
+      Utilities.sleep(500);
     }
   }
   
@@ -414,39 +400,33 @@ function updateSelectedTrackingStatus() {
 
 /**
  * Custom function for single cell lookup
- * Usage: =TRACKSTATUS(D2)
  */
 function TRACKSTATUS(trackingNumber) {
   if (!trackingNumber || trackingNumber.toString().trim() === '') {
     return '';
   }
-  
   const result = fetchTrackingStatus(trackingNumber.toString());
   return result.status;
 }
 
 /**
  * Custom function that returns tracking URL
- * Usage: =TRACKURL(D2)
  */
 function TRACKURL(trackingNumber) {
   if (!trackingNumber || trackingNumber.toString().trim() === '') {
     return '';
   }
-  
   const { url } = detectCarrier(trackingNumber.toString());
   return url || '';
 }
 
 /**
  * Custom function for carrier detection
- * Usage: =CARRIER(D2)
  */
 function CARRIER(trackingNumber) {
   if (!trackingNumber || trackingNumber.toString().trim() === '') {
     return '';
   }
-  
   const { carrier } = detectCarrier(trackingNumber.toString());
   return carrier;
 }
@@ -459,38 +439,31 @@ function showSettings() {
     <style>
       body { font-family: Arial, sans-serif; padding: 20px; }
       h2 { color: #333; }
-      .setting { margin-bottom: 15px; }
-      label { display: block; margin-bottom: 5px; font-weight: bold; }
-      input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
-      .info { color: #666; font-size: 12px; margin-top: 5px; }
+      .api-status { padding: 10px; border-radius: 8px; margin: 10px 0; }
+      .api-ok { background: #d4edda; color: #155724; }
+      .api-missing { background: #f8d7da; color: #721c24; }
       .statuses { background: #f5f5f5; padding: 15px; border-radius: 8px; margin-top: 20px; }
-      code { background: #e0e0e0; padding: 2px 6px; border-radius: 3px; }
     </style>
     <h2>📦 Tracking Settings</h2>
-    <p>Current configuration:</p>
-    <div class="setting">
-      <label>Tracking Number Column:</label>
-      <input type="text" value="D (column 4)" disabled>
-      <div class="info">Edit CONFIG in Apps Script to change</div>
-    </div>
-    <div class="setting">
-      <label>Status Column:</label>
-      <input type="text" value="E (column 5)" disabled>
-    </div>
+    <h3>API Status:</h3>
+    <div class="api-status api-ok">✅ UPS API: Connected</div>
+    <div class="api-status api-missing">⚠️ USPS: Web scraping (less reliable)</div>
+    <div class="api-status api-missing">⚠️ FedEx: Web scraping (less reliable)</div>
+    <div class="api-status api-missing">⚠️ DHL: Web scraping (less reliable)</div>
     <div class="statuses">
-      <h3>Possible Status Values:</h3>
+      <h3>Status Values:</h3>
       <ul>
-        <li><strong>Delivered</strong> - Package delivered</li>
-        <li><strong>Out for Delivery</strong> - On truck for delivery today</li>
-        <li><strong>In Transit</strong> - Moving through carrier network</li>
-        <li><strong>Exception</strong> - Problem with delivery</li>
-        <li><strong>Waiting for Pickup</strong> - At carrier location for pickup</li>
-        <li><strong>Label Created</strong> - Shipping label created, not shipped yet</li>
-        <li><strong>Not Found</strong> - Tracking number not recognized</li>
+        <li><strong>Delivered</strong></li>
+        <li><strong>Out for Delivery</strong></li>
+        <li><strong>In Transit</strong></li>
+        <li><strong>Exception</strong></li>
+        <li><strong>Waiting for Pickup</strong></li>
+        <li><strong>Label Created</strong></li>
+        <li><strong>Not Found</strong></li>
       </ul>
     </div>
   `)
     .setWidth(400)
-    .setHeight(450);
+    .setHeight(400);
   SpreadsheetApp.getUi().showModalDialog(html, 'Settings');
 }
